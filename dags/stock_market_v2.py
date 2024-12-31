@@ -2,18 +2,32 @@ from airflow.decorators import dag, task
 from airflow.operators.python import PythonOperator
 from airflow.hooks.base import BaseHook
 from airflow.sensors.base import PokeReturnValue
+from airflow.providers.slack.notifications.slack_notifier import SlackNotifier
 from airflow.providers.docker.operators.docker import DockerOperator
+from astro import sql as aql
+from astro.files import File
+from astro.sql.table import Table, Metadata
 from datetime import datetime
 import requests
 
-from include.stock_market.tasks import _get_stock_prices, _store_prices, _get_formatted_csv
+from include.stock_market.tasks import _get_stock_prices, _store_prices, _get_formatted_csv, BUCKET_NAME
 
 SYMBOL = 'AAPL'
 @dag(
     start_date = datetime(2023, 1, 1),
     schedule = '@daily',
     catchup = False,
-    tags = ['stock_market_v2']
+    tags = ['stock_market_v2'],
+    on_success_callback=SlackNotifier(
+        slack_conn_id='slack',
+        text='The DAG stock_market_v2 has succeeded',
+        channel='airflow'
+    ),
+    on_failure_callback=SlackNotifier(
+        slack_conn_id='slack',
+        text='The DAG stock_market_v2 has failed',
+        channel='airflow'
+    )
 )
 def stock_market_v2():
     @task.sensor(poke_interval=30, timeout=300, mode="poke" )
@@ -60,9 +74,22 @@ def stock_market_v2():
             'path': '{{task_instance.xcom_pull(task_ids="store_prices")}}'
         }
     )
+
+    load_to_dw = aql.load_file(
+        task_id='load_to_dw',
+        input_file=File(path=f"s3://{BUCKET_NAME}/{{{{task_instance.xcom_pull(task_ids='get_formatted_csv')}}}}", conn_id='minio'),
+        output_table=Table(
+            name='stock_market',
+            conn_id='postgres',
+            metadata=Metadata(
+                schema='public'
+            )
+        )
+
+    )
     
 
-    is_api_available() >> get_stock_prices >> store_prices >> format_prices >>get_formatted_csv
+    is_api_available() >> get_stock_prices >> store_prices >> format_prices >>get_formatted_csv >> load_to_dw
 
 
 
